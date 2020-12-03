@@ -298,9 +298,12 @@ class SmartDevice:
         req.update(self._create_request("system", "get_sysinfo"))
 
         # Check for emeter if we were never updated, or if the device has emeter
-        if self._last_update is None or self.has_emeter:
-            req.update(self._create_emeter_request())
-        self._last_update = await self.protocol.query(self.host, req)
+        if self._last_update is None:
+            self._last_update = await self.protocol.query(self.host, req)
+            self._sys_info = self._last_update["system"]["get_sysinfo"]
+
+        if self.has_emeter:
+            self._last_update = await self.protocol.query(self.host, req)
         # TODO: keep accessible for tests
         self._sys_info = self._last_update["system"]["get_sysinfo"]
 

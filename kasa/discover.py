@@ -33,11 +33,13 @@ class _DiscoverProtocol(asyncio.DatagramProtocol):
         *,
         on_discovered: OnDiscoveredCallable = None,
         target: str = "255.255.255.255",
+        timeout: int = 5,
         discovery_packets: int = 3,
         interface: Optional[str] = None,
     ):
         self.transport = None
-        self.discovery_packets = discovery_packets
+        self.tries = discovery_packets
+        self.timeout = timeout
         self.interface = interface
         self.on_discovered = on_discovered
         self.protocol = TPLinkSmartHomeProtocol()
@@ -63,7 +65,7 @@ class _DiscoverProtocol(asyncio.DatagramProtocol):
         req = json.dumps(Discover.DISCOVERY_QUERY)
         _LOGGER.debug("[DISCOVERY] %s >> %s", self.target, Discover.DISCOVERY_QUERY)
         encrypted_req = self.protocol.encrypt(req)
-        for i in range(self.discovery_packets):
+        for i in range(self.tries):
             self.transport.sendto(encrypted_req[4:], self.target)  # type: ignore
 
     def datagram_received(self, data, addr) -> None:
@@ -135,6 +137,10 @@ class Discover:
 
     DISCOVERY_QUERY = {
         "system": {"get_sysinfo": None},
+    }
+
+    COMPLETE_DISCOVERY_QUERY = {
+        "system": {"get_sysinfo": None},
         "emeter": {"get_realtime": None},
         "smartlife.iot.dimmer": {"get_dimmer_parameters": None},
         "smartlife.iot.common.emeter": {"get_realtime": None},
@@ -174,6 +180,7 @@ class Discover:
             lambda: _DiscoverProtocol(
                 target=target,
                 on_discovered=on_discovered,
+                timeout=timeout,
                 discovery_packets=discovery_packets,
                 interface=interface,
             ),
@@ -183,7 +190,7 @@ class Discover:
 
         try:
             _LOGGER.debug("Waiting %s seconds for responses...", timeout)
-            await asyncio.sleep(timeout)
+            await asyncio.sleep(5)
         finally:
             transport.close()
 
@@ -195,16 +202,20 @@ class Discover:
         return protocol.discovered_devices
 
     @staticmethod
-    async def discover_single(host: str) -> SmartDevice:
+    async def discover_single(host: str, complete: bool) -> SmartDevice:
         """Discover a single device by the given IP address.
 
         :param host: Hostname of device to query
+        :param complete: Whether to discover only with get_sysinfo or all options
         :rtype: SmartDevice
         :return: Object for querying/controlling found device.
         """
         protocol = TPLinkSmartHomeProtocol()
 
-        info = await protocol.query(host, Discover.DISCOVERY_QUERY)
+        if complete:
+            info = await protocol.query(host, Discover.COMPLETE_DISCOVERY_QUERY)
+        else:
+            info = await protocol.query(host, Discover.DISCOVERY_QUERY)
 
         device_class = Discover._get_device_class(info)
         if device_class is not None:
@@ -217,24 +228,29 @@ class Discover:
     @staticmethod
     def _get_device_class(info: dict) -> Type[SmartDevice]:
         """Find SmartDevice subclass for device described by passed data."""
-        if "system" not in info or "get_sysinfo" not in info["system"]:
-            raise SmartDeviceException("No 'system' or 'get_sysinfo' in response")
+        if "system" in info and "get_sysinfo" in info["system"]:
+            sysinfo = info["system"]["get_sysinfo"]
+            if "type" in sysinfo:
+                type_ = sysinfo["type"]
+            elif "mic_type" in sysinfo:
+                type_ = sysinfo["mic_type"]
+            else:
+                raise SmartDeviceException("Unable to find the device type field!")
+        else:
+            raise SmartDeviceException("No 'system' nor 'get_sysinfo' in response")
 
-        sysinfo = info["system"]["get_sysinfo"]
-        type_ = sysinfo.get("type", sysinfo.get("mic_type"))
-        if type_ is None:
-            raise SmartDeviceException("Unable to find the device type field!")
-
-        if "dev_name" in sysinfo and "Dimmer" in sysinfo["dev_name"]:
+        if "Dimmer" in sysinfo["dev_name"]:
             return SmartDimmer
 
-        if "smartplug" in type_.lower():
+        elif "smartplug" in type_.lower() and "children" in sysinfo:
+            return SmartStrip
+
+        elif "smartplug" in type_.lower():
             if "children" in sysinfo:
                 return SmartStrip
 
             return SmartPlug
-
-        if "smartbulb" in type_.lower():
+        elif "smartbulb" in type_.lower():
             if "length" in sysinfo:  # strips have length
                 return SmartLightStrip
 
@@ -254,3 +270,4 @@ if __name__ == "__main__":
     devices = loop.run_until_complete(Discover.discover(on_discovered=_on_device))
     for ip, dev in devices.items():
         print(f"[{ip}] {dev}")
+
